@@ -38,9 +38,9 @@ Dissenyat per a comptes **AWS Academy** (utilitza el rol `LabRole`).
 | Component | Descripcio |
 |-----------|-----------|
 | **EKS** | Cluster Kubernetes gestionat, 2 nodes t3.medium |
-| **EFS** | Sistema de fitxers compartit per WordPress i MySQL |
+| **EFS** | Sistema de fitxers compartit amb provisionament dinamic (Access Points automatics) |
 | **WordPress** | 2 repliques amb auto-instal·lacio via WP-CLI al `setup.sh` |
-| **MySQL 8.0** | Base de dades amb persistencia EFS (Access Point dedicat) |
+| **MySQL 8.0** | Base de dades amb persistencia EFS (StorageClass dedicada uid 999) |
 | **Redis 7** | Cache de sessions PHP centralitzades |
 
 ## Fitxers del projecte
@@ -52,10 +52,14 @@ terraform/
   outputs.tf           # efs_id, comandes utils
 k8s/
   01-namespace.yaml    # Namespace wordpress
-  02-storageclass.yaml # StorageClass + PVs estatics (EFS Access Points)
+  02-storageclass.yaml # StorageClasses EFS dinamic (WordPress uid=33, MySQL uid=999)
   03-mysql.yaml        # PVC + Deployment + Service headless
   04-redis.yaml        # Deployment + Service
   05-wordpress.yaml    # ConfigMap (setup.sh + redis-sessions.php) + PVC + Deploy + LB
+scripts/
+  setup-efs-dynamic.sh       # Configuracio inicial del provisionament dinamic
+  update-aws-credentials.sh  # Actualitzar credencials quan el lab es reinicia
+dynamic-efs.md         # Explicacio detallada del provisionament dinamic
 troubleshoot.md        # Problemes trobats i solucions
 README.md              # Aquesta guia
 presentacio/
@@ -119,54 +123,42 @@ kubectl get nodes
 
 Hauries de veure 2 nodes en estat `Ready`.
 
-## Pas 4: Crear EFS Access Points
+## Pas 4: Configurar el provisionament dinamic EFS
 
-AWS Academy no disposa d'OIDC provider, per tant el provisionament dinamic d'EFS no funciona.
-Cal crear **Access Points manualment** i usar **PVs estatics**.
+AWS Academy no te OIDC provider, per tant cal injectar les credencials AWS al
+controller EFS CSI perque puga crear Access Points automaticament.
+
+```bash
+# Executar l'script de configuracio (una sola vegada)
+./scripts/setup-efs-dynamic.sh
+```
+
+L'script fa 4 accions:
+1. Elimina l'anotacio IRSA del Service Account del controller
+2. Crea un Secret amb les credencials AWS del Learner Lab
+3. Injecta el Secret com a variables d'entorn als containers del controller
+4. Reinicia el controller
+
+> **Detalls:** Consulta [dynamic-efs.md](dynamic-efs.md) per una explicacio completa.
+
+## Pas 5: Actualitzar l'EFS ID als StorageClasses
 
 ```bash
 # Obtenir EFS ID
-EFS_ID=$(terraform output -raw efs_id)
+EFS_ID=$(cd terraform && terraform output -raw efs_id)
 
-# Access Point per MySQL (uid/gid 999 = mysql)
-MYSQL_AP=$(aws efs create-access-point \
-  --file-system-id $EFS_ID \
-  --posix-user "Uid=999,Gid=999" \
-  --root-directory "Path=/mysql,CreationInfo={OwnerUid=999,OwnerGid=999,Permissions=700}" \
-  --tags "Key=Name,Value=mysql-ap" \
-  --query 'AccessPointId' --output text)
-
-# Access Point per WordPress (uid/gid 33 = www-data)
-WP_AP=$(aws efs create-access-point \
-  --file-system-id $EFS_ID \
-  --posix-user "Uid=33,Gid=33" \
-  --root-directory "Path=/wordpress,CreationInfo={OwnerUid=33,OwnerGid=33,Permissions=755}" \
-  --tags "Key=Name,Value=wordpress-ap" \
-  --query 'AccessPointId' --output text)
-
-echo "EFS_ID:    $EFS_ID"
-echo "MySQL AP:  $MYSQL_AP"
-echo "WP AP:     $WP_AP"
-```
-
-## Pas 5: Actualitzar els PVs estatics als manifests
-
-Edita `k8s/02-storageclass.yaml` i substitueix els IDs dels volumeHandle:
-
-```bash
-# Substituir els IDs als PVs estatics
-sed -i "s|volumeHandle: .*mysql.*|volumeHandle: ${EFS_ID}::${MYSQL_AP}|" ../k8s/02-storageclass.yaml
-sed -i "s|volumeHandle: .*wordpress.*|volumeHandle: ${EFS_ID}::${WP_AP}|" ../k8s/02-storageclass.yaml
+# Actualitzar el fileSystemId als StorageClasses
+sed -i "s/fileSystemId: .*/fileSystemId: $EFS_ID/" k8s/02-storageclass.yaml
 
 # Verificar
-grep volumeHandle ../k8s/02-storageclass.yaml
+grep fileSystemId k8s/02-storageclass.yaml
 ```
 
 ## Pas 6: Desplegar WordPress a Kubernetes
 
 ```bash
 # Aplicar tots els manifests
-kubectl apply -f ../k8s/
+kubectl apply -f k8s/
 
 # Verificar els recursos
 kubectl get all,pvc -n wordpress
@@ -210,15 +202,23 @@ Obre `http://<EXTERNAL-IP>` al navegador. WordPress ja estara instal·lat automa
 | Usuari | `admin` |
 | Contrasenya | `Wp@Eks2026Secure` |
 
+## Quan el lab es reinicia
+
+Les credencials del Learner Lab caduquen quan el lab es reinicia. Cal actualitzar-les:
+
+```bash
+./scripts/update-aws-credentials.sh
+```
+
 ## Verificacions
 
-### Comprovar persistencia EFS
+### Comprovar persistencia EFS (provisionament dinamic)
 
 ```bash
 # Veure els PVCs (han d'estar Bound)
 kubectl get pvc -n wordpress
 
-# Veure els PVs estatics
+# Veure els PVs (creats automaticament pel controller)
 kubectl get pv
 ```
 
@@ -257,17 +257,16 @@ kubectl scale deploy/wordpress -n wordpress --replicas=3
 
 ```bash
 # 1. Eliminar els recursos Kubernetes
-kubectl delete -f ../k8s/
+kubectl delete -f k8s/
 
-# 2. Eliminar els Access Points d'EFS
-aws efs describe-access-points --file-system-id $EFS_ID --query 'AccessPoints[].AccessPointId' --output text | tr '\t' '\n' | while read ap; do
-  aws efs delete-access-point --access-point-id $ap
-done
-
-# 3. Destruir la infraestructura
-cd ../terraform
+# 2. Destruir la infraestructura
+cd terraform
 terraform destroy -auto-approve
 ```
+
+> **Nota:** Els Access Points creats dinamicament pel controller es netegen amb els PVs.
+> Si `reclaimPolicy: Retain`, cal eliminar-los manualment des de la consola AWS o amb
+> `aws efs delete-access-point`.
 
 ## Resolucio de problemes
 

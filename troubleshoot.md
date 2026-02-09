@@ -23,67 +23,44 @@ L'addon EFS CSI Driver intenta autenticar-se via **IRSA** (IAM Roles for Service
 que requereix un **OIDC Identity Provider** registrat al compte AWS. Els comptes d'**AWS Academy
 no tenen OIDC provider** configurat i LabRole no permet crear-ne un (`iam:CreateOpenIDConnectProvider`).
 
-Sense OIDC, el CSI controller no pot assumir el rol necessari per crear Access Points
-dinamicament.
+### Solucio aplicada: Injectar credencials AWS al controller
 
-### Solucio aplicada: Provisionament estatic amb Access Points manuals
-
-En lloc de dependre del provisionament dinamic, es van crear **Access Points manualment** i
-**PersistentVolumes estatics** que hi apunten.
-
-**1. Crear Access Points via AWS CLI:**
+En lloc de dependre d'IRSA/OIDC, s'injecten les credencials del Learner Lab com a
+**variables d'entorn** als containers del controller EFS CSI. L'AWS SDK v2 prioritza
+les variables d'entorn per sobre dels web identity tokens (IRSA), per tant el controller
+pot autenticar-se directament.
 
 ```bash
-# Access Point per MySQL (uid/gid 999)
-aws efs create-access-point \
-  --file-system-id fs-XXXXXXXX \
-  --posix-user "Uid=999,Gid=999" \
-  --root-directory "Path=/mysql,CreationInfo={OwnerUid=999,OwnerGid=999,Permissions=700}" \
-  --tags "Key=Name,Value=mysql-ap"
-
-# Access Point per WordPress (uid/gid 33 = www-data)
-aws efs create-access-point \
-  --file-system-id fs-XXXXXXXX \
-  --posix-user "Uid=33,Gid=33" \
-  --root-directory "Path=/wordpress,CreationInfo={OwnerUid=33,OwnerGid=33,Permissions=755}" \
-  --tags "Key=Name,Value=wordpress-ap"
+# Configuracio inicial (una sola vegada)
+./scripts/setup-efs-dynamic.sh
 ```
 
-**2. Crear PVs estatics al manifest `02-storageclass.yaml`:**
+L'script:
+1. Elimina l'anotacio IRSA del Service Account (`eks.amazonaws.com/role-arn-`)
+2. Crea un Secret `aws-credentials` amb `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`
+3. Patcheja el deployment per injectar el Secret via `envFrom`
+4. Reinicia el controller
 
-```yaml
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: efs-mysql-pv
-spec:
-  capacity:
-    storage: 5Gi
-  accessModes:
-    - ReadWriteMany
-  storageClassName: efs-sc
-  csi:
-    driver: efs.csi.aws.com
-    volumeHandle: fs-XXXXXXXX::fsap-YYYYYYYY   # EFS_ID::ACCESS_POINT_ID
-```
-
-**3. Vincular PVCs als PVs estatics amb `volumeName`:**
-
-```yaml
-apiVersion: v1
-kind: PersistentVolumeClaim
-spec:
-  volumeName: efs-mysql-pv     # <-- vincula al PV estatic
-  storageClassName: efs-sc
-  accessModes:
-    - ReadWriteMany
-```
+> **Detalls complets:** Consulta [dynamic-efs.md](dynamic-efs.md)
 
 ### Per que funciona
 
-El provisionament estatic no necessita que el CSI controller cree Access Points. Nomes
-necessita que el CSI **node plugin** (que corre als nodes) puga muntar el filesystem EFS,
-cosa que fa via NFS sense requerir IRSA.
+L'AWS SDK v2 resol credencials en aquest ordre:
+1. Variables d'entorn (AWS_ACCESS_KEY_ID, etc.) **<-- les injectem aqui**
+2. Fitxer de credencials
+3. Web Identity Token (IRSA) <-- falla sense OIDC
+4. EC2 IMDS
+
+Com que les variables d'entorn tenen prioritat maxima, el SDK les usa directament
+sense intentar IRSA.
+
+### Nota: credencials temporals
+
+Les credencials del Learner Lab caduquen quan el lab es reinicia. Cal executar:
+
+```bash
+./scripts/update-aws-credentials.sh
+```
 
 ---
 
@@ -219,18 +196,6 @@ kubectl exec deploy/wordpress -n wordpress -- \
   wp option update home "http://$LB_URL" --allow-root
 ```
 
-### Alternativa per automatitzar
-
-Es podria afegir al `setup.sh` un bucle que espere a que el LoadBalancer estiga
-disponible i actualitze la URL automaticament:
-
-```bash
-# Espera que el LoadBalancer resolga
-until nslookup $LB_HOSTNAME > /dev/null 2>&1; do sleep 10; done
-wp option update siteurl "http://$LB_HOSTNAME" --allow-root
-wp option update home "http://$LB_HOSTNAME" --allow-root
-```
-
 ---
 
 ## Problema 5: WordPress tarda a arrencar
@@ -263,11 +228,62 @@ Aixo reduiria el temps d'arrencada de ~90s a ~10s.
 
 ---
 
+## Problema 6: MySQL chown falla amb provisionament dinamic
+
+### Simptomes
+
+MySQL no arrenca i mostra l'error:
+
+```
+chown: changing ownership of '/var/lib/mysql/': Operation not permitted
+```
+
+### Causa
+
+Quan s'usa una sola StorageClass amb `uid: "33"` (www-data) per a tots els PVCs,
+l'Access Point de MySQL es crea amb propietari uid 33. MySQL (que corre com uid 999)
+no pot fer `chown` del directori perque EFS Access Points imposen el POSIX owner.
+
+### Solucio aplicada
+
+Crear una **StorageClass separada per MySQL** amb uid/gid 999:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc-mysql
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-XXXXXXXX
+  directoryPerms: "700"
+  basePath: "/mysql"
+  uid: "999"
+  gid: "999"
+```
+
+I el PVC de MySQL apunta a aquesta StorageClass:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+spec:
+  storageClassName: efs-sc-mysql   # <-- StorageClass amb uid 999
+```
+
+---
+
 ## Resum de canvis respecte al disseny original
 
 | Aspecte | Disseny original | Solucio final |
 |---------|-----------------|---------------|
-| EFS provisioning | Dinamic (StorageClass amb `efs-ap`) | Estatic (Access Points manuals + PVs) |
+| EFS provisioning | Dinamic (fallava per OIDC) | Dinamic amb credencials injectades |
+| Autenticacio CSI | IRSA (OIDC) | Variables d'entorn (AWS Secret) |
+| StorageClasses | Una sola | Dues: `efs-sc` (uid 33) + `efs-sc-mysql` (uid 999) |
 | Auto-instal·lacio | mu-plugin `auto-install.php` amb `wp_install()` | WP-CLI dins `setup.sh` |
 | URL WordPress | Automatica | Manual amb `wp option update` post-desplegament |
-| PVC binding | Automatic via StorageClass | Explicit amb `volumeName` |
+| Access Points | Manuals (AWS CLI) | Automatics (CSI controller) |
+| PersistentVolumes | Manuals (YAML) | Automatics |

@@ -6,8 +6,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteMany
-  storageClassName: efs-sc
-  volumeName: efs-mysql-pv
+  storageClassName: efs-sc-mysql
   resources:
     requests:
       storage: 5Gi

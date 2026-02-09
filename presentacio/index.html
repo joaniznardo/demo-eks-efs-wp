@@ -45,7 +45,7 @@
     <h2>Objectius</h2>
     <ul>
       <li>Cluster <span class="highlight-orange">EKS</span> en 2 zones de disponibilitat</li>
-      <li>Persistencia amb <span class="highlight-green">Amazon EFS</span> (Access Points estatics)</li>
+      <li>Persistencia amb <span class="highlight-green">Amazon EFS</span> (provisionament dinamic)</li>
       <li>Sessions PHP amb <span class="highlight-red">Redis</span></li>
       <li>Auto-instal&middot;lacio de WordPress via <span class="highlight-blue">WP-CLI</span></li>
       <li>Infraestructura com a codi amb <span class="highlight-blue">Terraform</span></li>
@@ -69,11 +69,11 @@
     │   └── Redis 7     │
     │                   │
     └── Amazon EFS ─────┘
-        ├── AP /mysql     (uid 999)
-        └── AP /wordpress (uid 33)
+        ├── AP /mysql     (uid 999) ─┐ Creats
+        └── AP /wordpress (uid 33)  ─┘ automaticament
       </pre>
     </div>
-    <p class="small">AP = EFS Access Point (provisionament estatic)</p>
+    <p class="small">AP = EFS Access Point (provisionament dinamic via credencials injectades)</p>
   </section>
 
   <!-- ================================================================== -->
@@ -130,7 +130,6 @@ aws_efs_file_system.main     # Sistema de fitxers EFS
 aws_efs_mount_target.main    # Mount targets (1 per AZ)
 aws_security_group.efs       # SG: permet NFS (2049)
       </code></pre>
-      <p class="small">+ 2 EFS Access Points creats via AWS CLI</p>
     </section>
     <section>
       <h3>AWS Academy: LabRole</h3>
@@ -188,59 +187,117 @@ resource "aws_efs_mount_target" "main" {
   </section>
 
   <!-- ================================================================== -->
-  <!-- PROBLEMA 1: OIDC / EFS PROVISIONING -->
+  <!-- PROBLEMA OIDC + SOLUCIO DINAMICA -->
   <!-- ================================================================== -->
   <section>
     <section>
-      <h2><span class="highlight-yellow">Problema 1</span></h2>
-      <h3>Provisionament dinamic EFS falla</h3>
+      <h2><span class="highlight-yellow">Problema clau</span></h2>
+      <h3>OIDC absent a AWS Academy</h3>
       <div class="problem-box">
         <p><strong>Error:</strong> <code>InvalidIdentityToken: No OpenIDConnect provider found</code></p>
-        <p>AWS Academy no te OIDC provider &rarr; el CSI driver no pot crear Access Points dinamicament</p>
+        <p>El CSI controller EFS usa IRSA &rarr; necessita OIDC &rarr; AWS Academy no en te</p>
       </div>
     </section>
     <section>
-      <h3>Solucio: PVs estatics</h3>
+      <h3>Cadena de credencials AWS SDK v2</h3>
+      <pre><code class="language-text">
+Ordre de resolucio:
+
+1. Variables d'entorn     &larr; INJECTEM AQUI
+   (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+
+2. Fitxer ~/.aws/credentials
+
+3. Web Identity Token (IRSA)  &larr; FALLA (no OIDC)
+
+4. EC2 Instance Metadata (IMDS)
+      </code></pre>
+      <p class="small">Les variables d'entorn tenen <strong>maxima prioritat</strong></p>
+    </section>
+    <section>
+      <h3>Solucio: injectar credencials</h3>
       <div class="solution-box">
-        <p>Crear <strong>Access Points manualment</strong> i usar <strong>PersistentVolumes estatics</strong></p>
+        <p>Injectar les credencials del Learner Lab com a <strong>variables d'entorn</strong>
+           al controller EFS CSI via un <strong>Kubernetes Secret</strong></p>
       </div>
       <pre><code class="language-bash">
-# Crear Access Points via AWS CLI
-aws efs create-access-point \
-  --file-system-id fs-XXX \
-  --posix-user "Uid=999,Gid=999" \
-  --root-directory "Path=/mysql,CreationInfo={...}"
+# 1. Eliminar anotacio IRSA
+kubectl annotate sa efs-csi-controller-sa -n kube-system \
+  eks.amazonaws.com/role-arn-
 
-aws efs create-access-point \
-  --file-system-id fs-XXX \
-  --posix-user "Uid=33,Gid=33" \
-  --root-directory "Path=/wordpress,CreationInfo={...}"
+# 2. Crear Secret amb credencials
+kubectl create secret generic aws-credentials \
+  -n kube-system \
+  --from-literal=AWS_ACCESS_KEY_ID="$KEY" \
+  --from-literal=AWS_SECRET_ACCESS_KEY="$SECRET" \
+  --from-literal=AWS_SESSION_TOKEN="$TOKEN"
+
+# 3. Injectar al controller (envFrom)
+kubectl patch deploy efs-csi-controller ...
+
+# 4. Reiniciar
+kubectl rollout restart deploy/efs-csi-controller
       </code></pre>
     </section>
     <section>
-      <h3>PV estatic amb Access Point</h3>
-      <pre><code class="language-yaml">
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: efs-mysql-pv
-spec:
-  capacity:
-    storage: 5Gi
-  accessModes:
-    - ReadWriteMany
-  storageClassName: efs-sc
-  csi:
-    driver: efs.csi.aws.com
-    # Format: EFS_ID::ACCESS_POINT_ID
-    volumeHandle: fs-XXX::fsap-YYY
----
-# PVC vinculat al PV
-kind: PersistentVolumeClaim
-spec:
-  volumeName: efs-mysql-pv   # Binding explicit
-  storageClassName: efs-sc
+      <h3>Resultat: provisionament dinamic!</h3>
+      <pre><code class="language-bash">
+$ kubectl get pvc -n wordpress
+NAME            STATUS   VOLUME     CAPACITY
+mysql-pvc       Bound    pvc-xxx    5Gi       # Auto-creat!
+wordpress-pvc   Bound    pvc-yyy    5Gi       # Auto-creat!
+
+$ kubectl get pv
+NAME      CAPACITY  RECLAIM   STATUS  STORAGECLASS
+pvc-xxx   5Gi       Retain    Bound   efs-sc-mysql
+pvc-yyy   5Gi       Retain    Bound   efs-sc
       </code></pre>
+      <p class="small">Access Points creats automaticament pel controller</p>
+    </section>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- STORAGECLASSES -->
+  <!-- ================================================================== -->
+  <section>
+    <section>
+      <h2>StorageClasses dinamic</h2>
+      <h3>Dues SC per a uid/gid correctes</h3>
+    </section>
+    <section>
+      <h3>WordPress (uid 33 = www-data)</h3>
+      <pre><code class="language-yaml">
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-XXXXXXXX
+  directoryPerms: "755"
+  basePath: "/wordpress"
+  uid: "33"       # www-data
+  gid: "33"
+      </code></pre>
+    </section>
+    <section>
+      <h3>MySQL (uid 999 = mysql)</h3>
+      <pre><code class="language-yaml">
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc-mysql
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-XXXXXXXX
+  directoryPerms: "700"
+  basePath: "/mysql"
+  uid: "999"      # mysql
+  gid: "999"
+      </code></pre>
+      <p class="small">Sense SC separada &rarr; MySQL falla amb <code>chown: Operation not permitted</code></p>
     </section>
   </section>
 
@@ -253,7 +310,7 @@ spec:
       <table>
         <tr><th>Fitxer</th><th>Contingut</th></tr>
         <tr><td><code>01-namespace.yaml</code></td><td>Namespace <code>wordpress</code></td></tr>
-        <tr><td><code>02-storageclass.yaml</code></td><td>StorageClass + <strong>PVs estatics</strong></td></tr>
+        <tr><td><code>02-storageclass.yaml</code></td><td>2 StorageClasses (dinamic)</td></tr>
         <tr><td><code>03-mysql.yaml</code></td><td>PVC + Deployment + Service</td></tr>
         <tr><td><code>04-redis.yaml</code></td><td>Deployment + Service</td></tr>
         <tr><td><code>05-wordpress.yaml</code></td><td>ConfigMap + PVC + Deploy + LB</td></tr>
@@ -349,19 +406,6 @@ pecl install redis > /dev/null 2>&1
 docker-php-ext-enable redis
       </code></pre>
     </section>
-    <section>
-      <h3>wp-config.php extra</h3>
-      <pre><code class="language-yaml">
-# Via env var WORDPRESS_CONFIG_EXTRA
-- name: WORDPRESS_CONFIG_EXTRA
-  value: |
-    /* Redis */
-    define('WP_REDIS_HOST', 'redis');
-    define('WP_REDIS_PORT', 6379);
-    define('WP_CACHE', true);
-      </code></pre>
-      <p class="small">Preparat per afegir un plugin d'Object Cache si cal</p>
-    </section>
   </section>
 
   <!-- ================================================================== -->
@@ -372,38 +416,31 @@ docker-php-ext-enable redis
     <ol>
       <li><code>terraform apply</code> &rarr; EKS + EFS (~15-20 min)</li>
       <li><code>aws eks update-kubeconfig</code> &rarr; configurar kubectl</li>
-      <li>Crear <strong>Access Points</strong> EFS via AWS CLI</li>
-      <li>Actualitzar <strong>volumeHandle</strong> als PVs estatics</li>
+      <li><code>./scripts/setup-efs-dynamic.sh</code> &rarr; configurar credencials CSI</li>
+      <li>Actualitzar <strong>fileSystemId</strong> als StorageClasses</li>
       <li><code>kubectl apply -f k8s/</code> &rarr; desplegar WordPress</li>
       <li>Actualitzar <strong>siteurl</strong> amb la IP del LoadBalancer</li>
     </ol>
   </section>
 
   <!-- ================================================================== -->
-  <!-- DEMO -->
+  <!-- SCRIPTS -->
   <!-- ================================================================== -->
   <section>
-    <h2>Comandes clau</h2>
-    <pre><code class="language-bash">
-# Infraestructura
-cd terraform && terraform apply -auto-approve
-aws eks update-kubeconfig --region us-east-1 --name wordpress-eks
-
-# Access Points
-EFS_ID=$(terraform output -raw efs_id)
-aws efs create-access-point --file-system-id $EFS_ID \
-  --posix-user "Uid=999,Gid=999" \
-  --root-directory "Path=/mysql,CreationInfo={...}"
-
-# Desplegar
-kubectl apply -f ../k8s/
-
-# Actualitzar URL
-LB=$(kubectl get svc wordpress -n wordpress \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-kubectl exec deploy/wordpress -n wordpress -- \
-  wp option update siteurl "http://$LB" --allow-root
-    </code></pre>
+    <h2>Scripts auxiliars</h2>
+    <table>
+      <tr><th>Script</th><th>Funcio</th><th>Quan</th></tr>
+      <tr>
+        <td><code>setup-efs-dynamic.sh</code></td>
+        <td>Configurar provisionament dinamic</td>
+        <td>Una sola vegada</td>
+      </tr>
+      <tr>
+        <td><code>update-aws-credentials.sh</code></td>
+        <td>Actualitzar credencials AWS</td>
+        <td>Cada reinici del lab</td>
+      </tr>
+    </table>
   </section>
 
   <!-- ================================================================== -->
@@ -430,14 +467,19 @@ service/wordpress   LoadBalancer xxx.elb.amazonaws.com
       </code></pre>
     </section>
     <section>
-      <h3>Persistencia EFS (PVs estatics)</h3>
+      <h3>Persistencia EFS (dinamic)</h3>
       <pre><code class="language-bash">
 $ kubectl get pv,pvc -n wordpress
 
-NAME              CAPACITY  ACCESS  STATUS  CLAIM
-efs-mysql-pv      5Gi       RWX     Bound   wordpress/mysql-pvc
-efs-wordpress-pv  5Gi       RWX     Bound   wordpress/wordpress-pvc
+NAME       CAPACITY  ACCESS  STATUS  STORAGECLASS
+pvc-xxx    5Gi       RWX     Bound   efs-sc-mysql
+pvc-yyy    5Gi       RWX     Bound   efs-sc
+
+NAME             STATUS  VOLUME   STORAGECLASS
+mysql-pvc        Bound   pvc-xxx  efs-sc-mysql
+wordpress-pvc    Bound   pvc-yyy  efs-sc
       </code></pre>
+      <p class="small">PVs i Access Points creats <strong>automaticament</strong></p>
     </section>
     <section>
       <h3>Redis + Escalar</h3>
@@ -462,7 +504,11 @@ kubectl scale deploy/wordpress -n wordpress --replicas=3
       <tr><th>Problema</th><th>Solucio</th></tr>
       <tr>
         <td>OIDC absent (AWS Academy)</td>
-        <td>PVs estatics + Access Points manuals</td>
+        <td>Injectar credencials via K8s Secret</td>
+      </tr>
+      <tr>
+        <td>MySQL chown sobre EFS</td>
+        <td>StorageClass separada (uid 999)</td>
       </tr>
       <tr>
         <td><code>wp_install()</code> en mu-plugin</td>
@@ -488,7 +534,7 @@ kubectl scale deploy/wordpress -n wordpress --replicas=3
       <tr><th>Aspecte</th><th>Solucio</th></tr>
       <tr><td>IaC</td><td>Terraform amb LabRole (AWS Academy)</td></tr>
       <tr><td>Orquestracio</td><td>EKS, 2 AZs, 2 nodes</td></tr>
-      <tr><td>Persistencia</td><td>EFS + Access Points + PVs estatics</td></tr>
+      <tr><td>Persistencia</td><td>EFS dinamic (credencials injectades al CSI)</td></tr>
       <tr><td>Sessions</td><td>Redis amb phpredis (mu-plugin)</td></tr>
       <tr><td>Auto-install</td><td>WP-CLI al setup.sh (ConfigMap)</td></tr>
       <tr><td>Alta disponibilitat</td><td>2 repliques WP + ReadWriteMany</td></tr>
@@ -502,7 +548,7 @@ kubectl scale deploy/wordpress -n wordpress --replicas=3
     <h1>Gracies!</h1>
     <p>Credencials WordPress:</p>
     <p><code>admin</code> / <code>Wp@Eks2026Secure</code></p>
-    <p class="small">Mes detalls: <code>troubleshoot.md</code></p>
+    <p class="small">Mes detalls: <code>dynamic-efs.md</code> | <code>troubleshoot.md</code></p>
   </section>
 
 </div>
