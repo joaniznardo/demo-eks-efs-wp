@@ -1,0 +1,275 @@
+# WordPress on EKS amb EFS i Redis
+
+Desplegament de WordPress sobre Amazon EKS amb persistencia EFS i sessions Redis.
+Dissenyat per a comptes **AWS Academy** (utilitza el rol `LabRole`).
+
+## Arquitectura
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │           VPC per defecte (us-east-1)   │
+                    │                                         │
+                    │  ┌──────────┐       ┌──────────┐       │
+                    │  │  AZ - a  │       │  AZ - b  │       │
+                    │  └────┬─────┘       └────┬─────┘       │
+                    │       │                  │              │
+                    │  ┌────┴──────────────────┴────┐        │
+                    │  │        EKS Cluster          │        │
+                    │  │                             │        │
+                    │  │  ┌───────────┐ ┌─────────┐ │        │
+                    │  │  │ WordPress │ │WordPress│ │        │
+                    │  │  │ (replica) │ │(replica)│ │        │
+                    │  │  └─────┬─────┘ └────┬────┘ │        │
+                    │  │        │             │      │        │
+                    │  │  ┌─────┴─────┐ ┌────┴───┐  │        │
+                    │  │  │   MySQL   │ │ Redis  │  │        │
+                    │  │  └─────┬─────┘ └────────┘  │        │
+                    │  └────────┼────────────────────┘        │
+                    │           │                              │
+                    │  ┌────────┴────────┐                    │
+                    │  │  Amazon EFS     │                    │
+                    │  │  (persistencia) │                    │
+                    │  └─────────────────┘                    │
+                    └─────────────────────────────────────────┘
+```
+
+## Components
+
+| Component | Descripcio |
+|-----------|-----------|
+| **EKS** | Cluster Kubernetes gestionat, 2 nodes t3.medium |
+| **EFS** | Sistema de fitxers compartit per WordPress i MySQL |
+| **WordPress** | 2 repliques amb auto-instal·lacio via WP-CLI al `setup.sh` |
+| **MySQL 8.0** | Base de dades amb persistencia EFS (Access Point dedicat) |
+| **Redis 7** | Cache de sessions PHP centralitzades |
+
+## Fitxers del projecte
+
+```
+terraform/
+  main.tf              # EKS + EFS + SG + Addon CSI (LabRole)
+  variables.tf         # region, cluster_name, eks_version
+  outputs.tf           # efs_id, comandes utils
+k8s/
+  01-namespace.yaml    # Namespace wordpress
+  02-storageclass.yaml # StorageClass + PVs estatics (EFS Access Points)
+  03-mysql.yaml        # PVC + Deployment + Service headless
+  04-redis.yaml        # Deployment + Service
+  05-wordpress.yaml    # ConfigMap (setup.sh + redis-sessions.php) + PVC + Deploy + LB
+troubleshoot.md        # Problemes trobats i solucions
+README.md              # Aquesta guia
+presentacio/
+  index.html           # Presentacio reveal.js
+```
+
+## Prerequisites
+
+- Compte AWS Academy amb Lab iniciat
+- AWS CLI configurat (o AWS CloudShell)
+- Terraform >= 1.5
+- kubectl
+
+## Pas 1: Iniciar el Lab AWS Academy
+
+1. Accedeix a AWS Academy i inicia el lab
+2. Copia les credencials AWS al fitxer `~/.aws/credentials`:
+
+```bash
+aws configure
+# O copia directament les credencials del lab
+```
+
+## Pas 2: Desplegar la infraestructura amb Terraform
+
+```bash
+cd terraform
+
+# Inicialitzar Terraform
+terraform init
+
+# Revisar el pla
+terraform plan
+
+# Aplicar (tarda ~15-20 minuts)
+terraform apply -auto-approve
+```
+
+> **Nota:** La creacio del cluster EKS tarda uns 7-10 minuts i el node group uns 3-5 minuts mes.
+
+Terraform crea 7 recursos:
+
+| Recurs | Descripcio |
+|--------|-----------|
+| `aws_security_group.efs` | SG que permet NFS (port 2049) des de la VPC |
+| `aws_eks_cluster.main` | Cluster EKS v1.31 amb LabRole |
+| `aws_eks_node_group.main` | 2 nodes t3.medium en 2 AZs |
+| `aws_efs_file_system.main` | Sistema de fitxers EFS |
+| `aws_efs_mount_target.main` x2 | Mount targets (1 per subnet/AZ) |
+| `aws_eks_addon.efs_csi` | Driver EFS CSI per Kubernetes |
+
+## Pas 3: Configurar kubectl
+
+```bash
+# Copiar la comanda de l'output de Terraform
+aws eks update-kubeconfig --region us-east-1 --name wordpress-eks
+
+# Verificar connexio
+kubectl get nodes
+```
+
+Hauries de veure 2 nodes en estat `Ready`.
+
+## Pas 4: Crear EFS Access Points
+
+AWS Academy no disposa d'OIDC provider, per tant el provisionament dinamic d'EFS no funciona.
+Cal crear **Access Points manualment** i usar **PVs estatics**.
+
+```bash
+# Obtenir EFS ID
+EFS_ID=$(terraform output -raw efs_id)
+
+# Access Point per MySQL (uid/gid 999 = mysql)
+MYSQL_AP=$(aws efs create-access-point \
+  --file-system-id $EFS_ID \
+  --posix-user "Uid=999,Gid=999" \
+  --root-directory "Path=/mysql,CreationInfo={OwnerUid=999,OwnerGid=999,Permissions=700}" \
+  --tags "Key=Name,Value=mysql-ap" \
+  --query 'AccessPointId' --output text)
+
+# Access Point per WordPress (uid/gid 33 = www-data)
+WP_AP=$(aws efs create-access-point \
+  --file-system-id $EFS_ID \
+  --posix-user "Uid=33,Gid=33" \
+  --root-directory "Path=/wordpress,CreationInfo={OwnerUid=33,OwnerGid=33,Permissions=755}" \
+  --tags "Key=Name,Value=wordpress-ap" \
+  --query 'AccessPointId' --output text)
+
+echo "EFS_ID:    $EFS_ID"
+echo "MySQL AP:  $MYSQL_AP"
+echo "WP AP:     $WP_AP"
+```
+
+## Pas 5: Actualitzar els PVs estatics als manifests
+
+Edita `k8s/02-storageclass.yaml` i substitueix els IDs dels volumeHandle:
+
+```bash
+# Substituir els IDs als PVs estatics
+sed -i "s|volumeHandle: .*mysql.*|volumeHandle: ${EFS_ID}::${MYSQL_AP}|" ../k8s/02-storageclass.yaml
+sed -i "s|volumeHandle: .*wordpress.*|volumeHandle: ${EFS_ID}::${WP_AP}|" ../k8s/02-storageclass.yaml
+
+# Verificar
+grep volumeHandle ../k8s/02-storageclass.yaml
+```
+
+## Pas 6: Desplegar WordPress a Kubernetes
+
+```bash
+# Aplicar tots els manifests
+kubectl apply -f ../k8s/
+
+# Verificar els recursos
+kubectl get all,pvc -n wordpress
+```
+
+## Pas 7: Esperar al desplegament
+
+```bash
+# Esperar que els pods estiguen llests
+kubectl wait --for=condition=ready pod -l app=mysql -n wordpress --timeout=300s
+kubectl wait --for=condition=ready pod -l app=redis -n wordpress --timeout=120s
+kubectl wait --for=condition=ready pod -l app=wordpress -n wordpress --timeout=300s
+```
+
+> **Nota:** El primer arrencament de WordPress tarda ~1-2 minuts extra perque:
+> 1. Instal·la l'extensio PHP Redis via PECL
+> 2. Descarrega WP-CLI
+> 3. Executa `wp core install` automaticament
+
+## Pas 8: Actualitzar la URL de WordPress
+
+```bash
+# Obtenir la URL del LoadBalancer
+LB_URL=$(kubectl get svc wordpress -n wordpress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+echo "URL: http://$LB_URL"
+
+# Actualitzar la URL de WordPress a la base de dades
+kubectl exec deploy/wordpress -n wordpress -- wp option update siteurl "http://$LB_URL" --allow-root
+kubectl exec deploy/wordpress -n wordpress -- wp option update home "http://$LB_URL" --allow-root
+```
+
+## Pas 9: Accedir a WordPress
+
+Obre `http://<EXTERNAL-IP>` al navegador. WordPress ja estara instal·lat automaticament.
+
+**Credencials per defecte:**
+
+| Camp | Valor |
+|------|-------|
+| URL admin | `http://<EXTERNAL-IP>/wp-admin` |
+| Usuari | `admin` |
+| Contrasenya | `Admin123!` |
+
+## Verificacions
+
+### Comprovar persistencia EFS
+
+```bash
+# Veure els PVCs (han d'estar Bound)
+kubectl get pvc -n wordpress
+
+# Veure els PVs estatics
+kubectl get pv
+```
+
+### Comprovar Redis
+
+```bash
+# Verificar extensio Redis carregada al pod
+kubectl exec deploy/wordpress -n wordpress -- php -r "echo extension_loaded('redis') ? 'OK' : 'FAIL';"
+
+# Test de connexio Redis
+kubectl exec deploy/wordpress -n wordpress -- php -r "
+\$r = new Redis();
+\$r->connect('redis.wordpress.svc.cluster.local', 6379);
+\$r->set('test','ok');
+echo \$r->get('test');
+"
+
+# Monitor de Redis en temps real
+kubectl exec -it deploy/redis -n wordpress -- redis-cli monitor
+```
+
+### Veure logs de WordPress
+
+```bash
+kubectl logs deploy/wordpress -n wordpress
+```
+
+### Escalar WordPress
+
+```bash
+# Escalar a 3 repliques (EFS permet ReadWriteMany)
+kubectl scale deploy/wordpress -n wordpress --replicas=3
+```
+
+## Neteja
+
+```bash
+# 1. Eliminar els recursos Kubernetes
+kubectl delete -f ../k8s/
+
+# 2. Eliminar els Access Points d'EFS
+aws efs describe-access-points --file-system-id $EFS_ID --query 'AccessPoints[].AccessPointId' --output text | tr '\t' '\n' | while read ap; do
+  aws efs delete-access-point --access-point-id $ap
+done
+
+# 3. Destruir la infraestructura
+cd ../terraform
+terraform destroy -auto-approve
+```
+
+## Resolucio de problemes
+
+Consulta el fitxer [troubleshoot.md](troubleshoot.md) per una llista detallada dels problemes
+coneguts i les solucions aplicades durant el desplegament.

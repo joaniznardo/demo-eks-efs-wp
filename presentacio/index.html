@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="ca">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WordPress on EKS amb EFS i Redis</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css">
+  <style>
+    .reveal h1, .reveal h2, .reveal h3 { text-transform: none; }
+    .reveal pre { width: 100%; font-size: 0.50em; }
+    .reveal .small { font-size: 0.6em; }
+    .reveal table { font-size: 0.7em; margin: 0 auto; }
+    .reveal table th, .reveal table td { padding: 0.3em 0.6em; }
+    .arch-box { background: #1a1a2e; border: 2px solid #16213e; border-radius: 10px; padding: 20px; display: inline-block; }
+    .highlight-orange { color: #f39c12; }
+    .highlight-green { color: #2ecc71; }
+    .highlight-blue { color: #3498db; }
+    .highlight-red { color: #e74c3c; }
+    .highlight-yellow { color: #f1c40f; }
+    .problem-box { background: #2c1810; border-left: 4px solid #e74c3c; padding: 10px 20px; text-align: left; margin: 10px 0; }
+    .solution-box { background: #102c10; border-left: 4px solid #2ecc71; padding: 10px 20px; text-align: left; margin: 10px 0; }
+  </style>
+</head>
+<body>
+
+<div class="reveal">
+<div class="slides">
+
+  <!-- ================================================================== -->
+  <!-- TITOL -->
+  <!-- ================================================================== -->
+  <section>
+    <h1>WordPress on <span class="highlight-orange">EKS</span></h1>
+    <h3>amb <span class="highlight-green">EFS</span> i <span class="highlight-red">Redis</span></h3>
+    <p>Desplegament complet sobre AWS Academy</p>
+    <p class="small">Terraform + Kubernetes Manifests</p>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- OBJECTIUS -->
+  <!-- ================================================================== -->
+  <section>
+    <h2>Objectius</h2>
+    <ul>
+      <li>Cluster <span class="highlight-orange">EKS</span> en 2 zones de disponibilitat</li>
+      <li>Persistencia amb <span class="highlight-green">Amazon EFS</span> (Access Points estatics)</li>
+      <li>Sessions PHP amb <span class="highlight-red">Redis</span></li>
+      <li>Auto-instal&middot;lacio de WordPress via <span class="highlight-blue">WP-CLI</span></li>
+      <li>Infraestructura com a codi amb <span class="highlight-blue">Terraform</span></li>
+    </ul>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- ARQUITECTURA -->
+  <!-- ================================================================== -->
+  <section>
+    <h2>Arquitectura</h2>
+    <div class="arch-box">
+      <pre style="font-size: 0.45em; text-align: left; color: #ecf0f1;">
+    VPC per defecte (us-east-1)
+    ├── AZ us-east-1a ──┐
+    ├── AZ us-east-1b ──┤
+    │                   │
+    │   EKS Cluster     │
+    │   ├── WordPress (x2 repliques)
+    │   ├── MySQL 8.0   │
+    │   └── Redis 7     │
+    │                   │
+    └── Amazon EFS ─────┘
+        ├── AP /mysql     (uid 999)
+        └── AP /wordpress (uid 33)
+      </pre>
+    </div>
+    <p class="small">AP = EFS Access Point (provisionament estatic)</p>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- COMPONENTS -->
+  <!-- ================================================================== -->
+  <section>
+    <section>
+      <h2>Components</h2>
+      <table>
+        <tr><th>Component</th><th>Funcio</th></tr>
+        <tr><td><span class="highlight-orange">EKS</span></td><td>Orquestrador Kubernetes gestionat</td></tr>
+        <tr><td><span class="highlight-green">EFS</span></td><td>Persistencia compartida (ReadWriteMany)</td></tr>
+        <tr><td><span class="highlight-blue">WordPress</span></td><td>CMS amb 2 repliques + auto-install via WP-CLI</td></tr>
+        <tr><td>MySQL 8.0</td><td>Base de dades relacional</td></tr>
+        <tr><td><span class="highlight-red">Redis 7</span></td><td>Emmagatzematge de sessions PHP</td></tr>
+      </table>
+    </section>
+    <section>
+      <h3>Per que EFS?</h3>
+      <ul>
+        <li><strong>ReadWriteMany</strong>: multiples pods poden escriure al mateix temps</li>
+        <li>Escala automaticament (sense aprovisionar tamany)</li>
+        <li>Compatible amb el CSI driver d'EKS</li>
+        <li>Ideal per fitxers de WordPress compartits entre repliques</li>
+      </ul>
+    </section>
+    <section>
+      <h3>Per que Redis?</h3>
+      <ul>
+        <li>Sessions PHP centralitzades entre repliques</li>
+        <li>Evita perdua de sessio quan el LB envia a un altre pod</li>
+        <li>Rendiment: emmagatzematge en memoria</li>
+        <li>Facil d'escalar i substituir</li>
+      </ul>
+    </section>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- TERRAFORM -->
+  <!-- ================================================================== -->
+  <section>
+    <section>
+      <h2><span class="highlight-blue">Terraform</span></h2>
+      <h3>Infraestructura com a Codi</h3>
+      <p>3 fitxers: <code>main.tf</code> / <code>variables.tf</code> / <code>outputs.tf</code></p>
+    </section>
+    <section>
+      <h3>Recursos creats (7)</h3>
+      <pre><code class="language-text">
+aws_eks_cluster.main         # Cluster EKS v1.31
+aws_eks_node_group.main      # 2 nodes t3.medium
+aws_eks_addon.efs_csi        # EFS CSI Driver
+aws_efs_file_system.main     # Sistema de fitxers EFS
+aws_efs_mount_target.main    # Mount targets (1 per AZ)
+aws_security_group.efs       # SG: permet NFS (2049)
+      </code></pre>
+      <p class="small">+ 2 EFS Access Points creats via AWS CLI</p>
+    </section>
+    <section>
+      <h3>AWS Academy: LabRole</h3>
+      <pre><code class="language-hcl">
+# No podem crear IAM roles a AWS Academy
+# Utilitzem LabRole per tot
+
+locals {
+  lab_role_arn = "arn:aws:iam::${
+    data.aws_caller_identity.current.account_id
+  }:role/LabRole"
+}
+
+resource "aws_eks_cluster" "main" {
+  name     = "wordpress-eks"
+  role_arn = local.lab_role_arn
+  # ...
+}
+      </code></pre>
+    </section>
+    <section>
+      <h3>VPC per defecte + 2 AZs</h3>
+      <pre><code class="language-hcl">
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "availability-zone"
+    values = ["us-east-1a", "us-east-1b"]
+  }
+}
+      </code></pre>
+    </section>
+    <section>
+      <h3>EFS + Security Group</h3>
+      <pre><code class="language-hcl">
+resource "aws_efs_file_system" "main" {
+  creation_token = "wordpress-eks-efs"
+}
+
+resource "aws_efs_mount_target" "main" {
+  for_each        = toset(data.aws_subnets.default.ids)
+  file_system_id  = aws_efs_file_system.main.id
+  subnet_id       = each.value
+  security_groups = [aws_security_group.efs.id]
+}
+      </code></pre>
+    </section>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- PROBLEMA 1: OIDC / EFS PROVISIONING -->
+  <!-- ================================================================== -->
+  <section>
+    <section>
+      <h2><span class="highlight-yellow">Problema 1</span></h2>
+      <h3>Provisionament dinamic EFS falla</h3>
+      <div class="problem-box">
+        <p><strong>Error:</strong> <code>InvalidIdentityToken: No OpenIDConnect provider found</code></p>
+        <p>AWS Academy no te OIDC provider &rarr; el CSI driver no pot crear Access Points dinamicament</p>
+      </div>
+    </section>
+    <section>
+      <h3>Solucio: PVs estatics</h3>
+      <div class="solution-box">
+        <p>Crear <strong>Access Points manualment</strong> i usar <strong>PersistentVolumes estatics</strong></p>
+      </div>
+      <pre><code class="language-bash">
+# Crear Access Points via AWS CLI
+aws efs create-access-point \
+  --file-system-id fs-XXX \
+  --posix-user "Uid=999,Gid=999" \
+  --root-directory "Path=/mysql,CreationInfo={...}"
+
+aws efs create-access-point \
+  --file-system-id fs-XXX \
+  --posix-user "Uid=33,Gid=33" \
+  --root-directory "Path=/wordpress,CreationInfo={...}"
+      </code></pre>
+    </section>
+    <section>
+      <h3>PV estatic amb Access Point</h3>
+      <pre><code class="language-yaml">
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: efs-mysql-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  csi:
+    driver: efs.csi.aws.com
+    # Format: EFS_ID::ACCESS_POINT_ID
+    volumeHandle: fs-XXX::fsap-YYY
+---
+# PVC vinculat al PV
+kind: PersistentVolumeClaim
+spec:
+  volumeName: efs-mysql-pv   # Binding explicit
+  storageClassName: efs-sc
+      </code></pre>
+    </section>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- KUBERNETES MANIFESTS -->
+  <!-- ================================================================== -->
+  <section>
+    <section>
+      <h2>Kubernetes Manifests</h2>
+      <table>
+        <tr><th>Fitxer</th><th>Contingut</th></tr>
+        <tr><td><code>01-namespace.yaml</code></td><td>Namespace <code>wordpress</code></td></tr>
+        <tr><td><code>02-storageclass.yaml</code></td><td>StorageClass + <strong>PVs estatics</strong></td></tr>
+        <tr><td><code>03-mysql.yaml</code></td><td>PVC + Deployment + Service</td></tr>
+        <tr><td><code>04-redis.yaml</code></td><td>Deployment + Service</td></tr>
+        <tr><td><code>05-wordpress.yaml</code></td><td>ConfigMap + PVC + Deploy + LB</td></tr>
+      </table>
+    </section>
+    <section>
+      <h3>MySQL sobre EFS</h3>
+      <pre><code class="language-yaml">
+containers:
+  - name: mysql
+    image: mysql:8.0
+    args:   # Necessari per NFS/EFS
+      - --innodb-use-native-aio=0
+      - --innodb-flush-method=fsync
+    env:
+      - name: MYSQL_DATABASE
+        value: wordpress
+    volumeMounts:
+      - name: mysql-data
+        mountPath: /var/lib/mysql
+      </code></pre>
+      <p class="small"><code>innodb-use-native-aio=0</code> &rarr; MySQL funciona sobre NFS</p>
+    </section>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- PROBLEMA 2: AUTO-INSTALL -->
+  <!-- ================================================================== -->
+  <section>
+    <section>
+      <h2><span class="highlight-yellow">Problema 2</span></h2>
+      <h3>Auto-instal&middot;lacio via mu-plugin falla</h3>
+      <div class="problem-box">
+        <p><strong>Error:</strong> <code>One or more database tables are unavailable</code></p>
+        <p><code>wp_install()</code> no funciona des de mu-plugins (massa aviat en el bootstrap)</p>
+        <p>Resultat: taules creades pero sense dades</p>
+      </div>
+    </section>
+    <section>
+      <h3>Solucio: WP-CLI al setup.sh</h3>
+      <div class="solution-box">
+        <p>Usar <strong>WP-CLI</strong> dins l'script d'arrencada, despres que WordPress estiga completament inicialitzat</p>
+      </div>
+      <pre><code class="language-bash">
+# setup.sh (ConfigMap)
+docker-entrypoint.sh apache2-foreground &
+WP_PID=$!
+
+# Espera fitxers WP + MySQL
+until [ -f /var/www/html/wp-includes/version.php ]; do sleep 2; done
+until wp db check --allow-root > /dev/null 2>&1; do sleep 3; done
+
+# Instal·la amb lock per evitar race condition
+if ! wp core is-installed --allow-root 2>/dev/null; then
+  if [ ! -f "/var/www/html/.wp-installed.lock" ]; then
+    touch "/var/www/html/.wp-installed.lock"
+    wp core install --url="http://localhost" \
+      --title="WordPress on EKS" \
+      --admin_user=admin --admin_password="Admin123!" \
+      --admin_email=admin@example.com --allow-root
+  fi
+fi
+wait $WP_PID
+      </code></pre>
+    </section>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- REDIS SESSIONS -->
+  <!-- ================================================================== -->
+  <section>
+    <section>
+      <h2><span class="highlight-red">Redis</span> per Sessions</h2>
+    </section>
+    <section>
+      <h3>Problema</h3>
+      <p>Amb 2+ repliques de WordPress, el LoadBalancer pot enviar
+         peticions a pods diferents &rarr; <strong>perdua de sessio</strong></p>
+    </section>
+    <section>
+      <h3>Solucio: mu-plugin + phpredis</h3>
+      <pre><code class="language-php">
+// mu-plugins/redis-sessions.php (via ConfigMap)
+if ( extension_loaded('redis') ) {
+    ini_set('session.save_handler', 'redis');
+    ini_set('session.save_path',
+      'tcp://redis.wordpress.svc.cluster.local:6379');
+}
+      </code></pre>
+      <pre><code class="language-bash">
+# setup.sh instal·la phpredis a l'inici
+pecl install redis > /dev/null 2>&1
+docker-php-ext-enable redis
+      </code></pre>
+    </section>
+    <section>
+      <h3>wp-config.php extra</h3>
+      <pre><code class="language-yaml">
+# Via env var WORDPRESS_CONFIG_EXTRA
+- name: WORDPRESS_CONFIG_EXTRA
+  value: |
+    /* Redis */
+    define('WP_REDIS_HOST', 'redis');
+    define('WP_REDIS_PORT', 6379);
+    define('WP_CACHE', true);
+      </code></pre>
+      <p class="small">Preparat per afegir un plugin d'Object Cache si cal</p>
+    </section>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- FLUX DE DESPLEGAMENT -->
+  <!-- ================================================================== -->
+  <section>
+    <h2>Flux de desplegament</h2>
+    <ol>
+      <li><code>terraform apply</code> &rarr; EKS + EFS (~15-20 min)</li>
+      <li><code>aws eks update-kubeconfig</code> &rarr; configurar kubectl</li>
+      <li>Crear <strong>Access Points</strong> EFS via AWS CLI</li>
+      <li>Actualitzar <strong>volumeHandle</strong> als PVs estatics</li>
+      <li><code>kubectl apply -f k8s/</code> &rarr; desplegar WordPress</li>
+      <li>Actualitzar <strong>siteurl</strong> amb la IP del LoadBalancer</li>
+    </ol>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- DEMO -->
+  <!-- ================================================================== -->
+  <section>
+    <h2>Comandes clau</h2>
+    <pre><code class="language-bash">
+# Infraestructura
+cd terraform && terraform apply -auto-approve
+aws eks update-kubeconfig --region us-east-1 --name wordpress-eks
+
+# Access Points
+EFS_ID=$(terraform output -raw efs_id)
+aws efs create-access-point --file-system-id $EFS_ID \
+  --posix-user "Uid=999,Gid=999" \
+  --root-directory "Path=/mysql,CreationInfo={...}"
+
+# Desplegar
+kubectl apply -f ../k8s/
+
+# Actualitzar URL
+LB=$(kubectl get svc wordpress -n wordpress \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+kubectl exec deploy/wordpress -n wordpress -- \
+  wp option update siteurl "http://$LB" --allow-root
+    </code></pre>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- VERIFICACIO -->
+  <!-- ================================================================== -->
+  <section>
+    <section>
+      <h2>Verificacio</h2>
+    </section>
+    <section>
+      <h3>Pods i serveis</h3>
+      <pre><code class="language-bash">
+$ kubectl get all -n wordpress
+
+NAME                            READY   STATUS
+pod/mysql-xxx                   1/1     Running
+pod/redis-xxx                   1/1     Running
+pod/wordpress-xxx               1/1     Running
+pod/wordpress-yyy               1/1     Running
+
+service/mysql       ClusterIP   None
+service/redis       ClusterIP   10.x.x.x
+service/wordpress   LoadBalancer xxx.elb.amazonaws.com
+      </code></pre>
+    </section>
+    <section>
+      <h3>Persistencia EFS (PVs estatics)</h3>
+      <pre><code class="language-bash">
+$ kubectl get pv,pvc -n wordpress
+
+NAME              CAPACITY  ACCESS  STATUS  CLAIM
+efs-mysql-pv      5Gi       RWX     Bound   wordpress/mysql-pvc
+efs-wordpress-pv  5Gi       RWX     Bound   wordpress/wordpress-pvc
+      </code></pre>
+    </section>
+    <section>
+      <h3>Redis + Escalar</h3>
+      <pre><code class="language-bash">
+# Verificar Redis
+kubectl exec deploy/wordpress -n wordpress -- \
+  php -r "echo extension_loaded('redis') ? 'OK' : 'FAIL';"
+# OK
+
+# Escalar (EFS ReadWriteMany)
+kubectl scale deploy/wordpress -n wordpress --replicas=3
+      </code></pre>
+    </section>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- LESSONS LEARNED -->
+  <!-- ================================================================== -->
+  <section>
+    <h2>Llicons apreses</h2>
+    <table>
+      <tr><th>Problema</th><th>Solucio</th></tr>
+      <tr>
+        <td>OIDC absent (AWS Academy)</td>
+        <td>PVs estatics + Access Points manuals</td>
+      </tr>
+      <tr>
+        <td><code>wp_install()</code> en mu-plugin</td>
+        <td>WP-CLI al <code>setup.sh</code></td>
+      </tr>
+      <tr>
+        <td>MySQL sobre NFS</td>
+        <td><code>innodb-use-native-aio=0</code></td>
+      </tr>
+      <tr>
+        <td>URL localhost</td>
+        <td><code>wp option update</code> post-deploy</td>
+      </tr>
+    </table>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- RESUM -->
+  <!-- ================================================================== -->
+  <section>
+    <h2>Resum</h2>
+    <table>
+      <tr><th>Aspecte</th><th>Solucio</th></tr>
+      <tr><td>IaC</td><td>Terraform amb LabRole (AWS Academy)</td></tr>
+      <tr><td>Orquestracio</td><td>EKS, 2 AZs, 2 nodes</td></tr>
+      <tr><td>Persistencia</td><td>EFS + Access Points + PVs estatics</td></tr>
+      <tr><td>Sessions</td><td>Redis amb phpredis (mu-plugin)</td></tr>
+      <tr><td>Auto-install</td><td>WP-CLI al setup.sh (ConfigMap)</td></tr>
+      <tr><td>Alta disponibilitat</td><td>2 repliques WP + ReadWriteMany</td></tr>
+    </table>
+  </section>
+
+  <!-- ================================================================== -->
+  <!-- FINAL -->
+  <!-- ================================================================== -->
+  <section>
+    <h1>Gracies!</h1>
+    <p>Credencials WordPress:</p>
+    <p><code>admin</code> / <code>Admin123!</code></p>
+    <p class="small">Mes detalls: <code>troubleshoot.md</code></p>
+  </section>
+
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+<script>
+  Reveal.initialize({
+    hash: true,
+    slideNumber: true,
+    plugins: [ RevealHighlight ]
+  });
+</script>
+</body>
+</html>

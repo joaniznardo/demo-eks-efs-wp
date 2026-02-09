@@ -1,0 +1,149 @@
+# ---------------------------------------------------------------------------
+# ConfigMap: scripts d'auto-instal·lacio i configuracio Redis
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wordpress-config
+  namespace: wordpress
+data:
+  # MU-Plugin: configura sessions PHP amb Redis
+  redis-sessions.php: |
+    <?php
+    if ( extension_loaded( 'redis' ) ) {
+        ini_set( 'session.save_handler', 'redis' );
+        ini_set( 'session.save_path', 'tcp://redis.wordpress.svc.cluster.local:6379' );
+    }
+
+  # Script d'arrencada: instal·la Redis, WP-CLI i auto-instal·la WordPress
+  setup.sh: |
+    #!/bin/bash
+    set -e
+    # Instal·la l'extensio PHP Redis
+    pecl install redis > /dev/null 2>&1
+    docker-php-ext-enable redis
+    # Inicia l'entrypoint original de WordPress en segon pla
+    docker-entrypoint.sh apache2-foreground &
+    WP_PID=$!
+    # Espera que WordPress estiga llest
+    until [ -f /var/www/html/wp-includes/version.php ]; do sleep 2; done
+    # Descarrega WP-CLI
+    curl -sO https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+    chmod +x wp-cli.phar && mv wp-cli.phar /usr/local/bin/wp
+    # Espera que MySQL estiga disponible
+    until wp db check --path=/var/www/html --allow-root > /dev/null 2>&1; do sleep 3; done
+    # Instal·la WordPress si no esta instal·lat (lock en EFS)
+    LOCK=/var/www/html/.wp-installed.lock
+    if ! wp core is-installed --path=/var/www/html --allow-root 2>/dev/null; then
+      if [ ! -f "$LOCK" ]; then
+        touch "$LOCK"
+        wp core install \
+          --url="http://localhost" \
+          --title="WordPress on EKS" \
+          --admin_user=admin \
+          --admin_password="Admin123!" \
+          --admin_email=admin@example.com \
+          --path=/var/www/html \
+          --allow-root
+      fi
+    fi
+    # Espera el proces principal
+    wait $WP_PID
+
+---
+# ---------------------------------------------------------------------------
+# PVC per als fitxers de WordPress (EFS)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wordpress-pvc
+  namespace: wordpress
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  volumeName: efs-wordpress-pv
+  resources:
+    requests:
+      storage: 5Gi
+---
+# ---------------------------------------------------------------------------
+# Deployment de WordPress
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordpress
+  namespace: wordpress
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: wordpress
+  template:
+    metadata:
+      labels:
+        app: wordpress
+    spec:
+      containers:
+        - name: wordpress
+          image: wordpress:6.7-php8.3-apache
+          command: ["/bin/bash", "/tmp/config/setup.sh"]
+          env:
+            - name: WORDPRESS_DB_HOST
+              value: mysql
+            - name: WORDPRESS_DB_USER
+              value: wordpress
+            - name: WORDPRESS_DB_PASSWORD
+              value: wordpress
+            - name: WORDPRESS_DB_NAME
+              value: wordpress
+            - name: WORDPRESS_CONFIG_EXTRA
+              value: |
+                /* Redis */
+                define('WP_REDIS_HOST', 'redis');
+                define('WP_REDIS_PORT', 6379);
+                define('WP_CACHE', true);
+          ports:
+            - containerPort: 80
+          # Copia els mu-plugins despres que l'entrypoint copie els fitxers WP
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    until [ -d /var/www/html/wp-content ]; do sleep 2; done
+                    mkdir -p /var/www/html/wp-content/mu-plugins
+                    cp /tmp/config/redis-sessions.php /var/www/html/wp-content/mu-plugins/
+          volumeMounts:
+            - name: wordpress-data
+              mountPath: /var/www/html
+            - name: config
+              mountPath: /tmp/config
+      volumes:
+        - name: wordpress-data
+          persistentVolumeClaim:
+            claimName: wordpress-pvc
+        - name: config
+          configMap:
+            name: wordpress-config
+            defaultMode: 0755
+---
+# ---------------------------------------------------------------------------
+# Service LoadBalancer per accedir a WordPress
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress
+  namespace: wordpress
+spec:
+  type: LoadBalancer
+  selector:
+    app: wordpress
+  ports:
+    - port: 80
+      targetPort: 80
