@@ -138,7 +138,7 @@ if ! wp core is-installed --path=/var/www/html --allow-root 2>/dev/null; then
       --url="http://localhost" \
       --title="WordPress on EKS" \
       --admin_user=admin \
-      --admin_password="Admin123!" \
+      --admin_password="Wp@Eks2026Secure" \
       --admin_email=admin@example.com \
       --path=/var/www/html \
       --allow-root

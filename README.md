@@ -208,7 +208,7 @@ Obre `http://<EXTERNAL-IP>` al navegador. WordPress ja estara instal·lat automa
 |------|-------|
 | URL admin | `http://<EXTERNAL-IP>/wp-admin` |
 | Usuari | `admin` |
-| Contrasenya | `Admin123!` |
+| Contrasenya | `Wp@Eks2026Secure` |
 
 ## Verificacions
 

@@ -312,7 +312,7 @@ if ! wp core is-installed --allow-root 2>/dev/null; then
     touch "/var/www/html/.wp-installed.lock"
     wp core install --url="http://localhost" \
       --title="WordPress on EKS" \
-      --admin_user=admin --admin_password="Admin123!" \
+      --admin_user=admin --admin_password="Wp@Eks2026Secure" \
       --admin_email=admin@example.com --allow-root
   fi
 fi
@@ -501,7 +501,7 @@ kubectl scale deploy/wordpress -n wordpress --replicas=3
   <section>
     <h1>Gracies!</h1>
     <p>Credencials WordPress:</p>
-    <p><code>admin</code> / <code>Admin123!</code></p>
+    <p><code>admin</code> / <code>Wp@Eks2026Secure</code></p>
     <p class="small">Mes detalls: <code>troubleshoot.md</code></p>
   </section>
 
