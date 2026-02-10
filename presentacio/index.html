@@ -73,7 +73,7 @@
         └── AP /wordpress (uid 33)  ─┘ automaticament
       </pre>
     </div>
-    <p class="small">AP = EFS Access Point (provisionament dinamic via credencials injectades)</p>
+    <p class="small">AP = EFS Access Point (provisionament dinamic via AWS Secrets Manager)</p>
   </section>
 
   <!-- ================================================================== -->
@@ -215,9 +215,10 @@ Ordre de resolucio:
       <p class="small">Les variables d'entorn tenen <strong>maxima prioritat</strong></p>
     </section>
     <section>
-      <h3>Solucio: injectar credencials</h3>
+      <h3>Solucio: credencials via Secrets Manager</h3>
       <div class="solution-box">
-        <p>Injectar les credencials del Learner Lab com a <strong>variables d'entorn</strong>
+        <p>Centralitzar credencials a <strong>AWS Secrets Manager</strong> i
+           injectar-les com a <strong>variables d'entorn</strong>
            al controller EFS CSI via un <strong>Kubernetes Secret</strong></p>
       </div>
       <pre><code class="language-bash">
@@ -225,18 +226,17 @@ Ordre de resolucio:
 kubectl annotate sa efs-csi-controller-sa -n kube-system \
   eks.amazonaws.com/role-arn-
 
-# 2. Crear Secret amb credencials
-kubectl create secret generic aws-credentials \
-  -n kube-system \
-  --from-literal=AWS_ACCESS_KEY_ID="$KEY" \
-  --from-literal=AWS_SECRET_ACCESS_KEY="$SECRET" \
-  --from-literal=AWS_SESSION_TOKEN="$TOKEN"
+# 2. Pujar credencials a AWS Secrets Manager
+aws secretsmanager create-secret \
+  --name eks-efs-credentials \
+  --secret-string '{"AWS_ACCESS_KEY_ID":"...","AWS_SECRET_ACCESS_KEY":"...","AWS_SESSION_TOKEN":"..."}'
 
-# 3. Injectar al controller (envFrom)
+# 3. Llegir de Secrets Manager &rarr; crear K8s Secret
+SM_VALUE=$(aws secretsmanager get-secret-value --secret-id eks-efs-credentials ...)
+kubectl create secret generic aws-credentials ...
+
+# 4. Injectar al controller (envFrom) + reiniciar
 kubectl patch deploy efs-csi-controller ...
-
-# 4. Reiniciar
-kubectl rollout restart deploy/efs-csi-controller
       </code></pre>
     </section>
     <section>
@@ -416,11 +416,12 @@ docker-php-ext-enable redis
     <ol>
       <li><code>terraform apply</code> &rarr; EKS + EFS (~15-20 min)</li>
       <li><code>aws eks update-kubeconfig</code> &rarr; configurar kubectl</li>
-      <li><code>./scripts/setup-efs-dynamic.sh</code> &rarr; configurar credencials CSI</li>
+      <li><code>./scripts/setup-efs-dynamic.sh</code> &rarr; credencials via <span class="highlight-orange">Secrets Manager</span> + CSI</li>
       <li>Actualitzar <strong>fileSystemId</strong> als StorageClasses</li>
       <li><code>kubectl apply -f k8s/</code> &rarr; desplegar WordPress</li>
       <li>Actualitzar <strong>siteurl</strong> amb la IP del LoadBalancer</li>
     </ol>
+    <p class="small">Flux de credencials: <code>~/.aws/credentials</code> &rarr; <span class="highlight-orange">AWS Secrets Manager</span> &rarr; K8s Secret &rarr; EFS CSI Controller</p>
   </section>
 
   <!-- ================================================================== -->
@@ -504,7 +505,7 @@ kubectl scale deploy/wordpress -n wordpress --replicas=3
       <tr><th>Problema</th><th>Solucio</th></tr>
       <tr>
         <td>OIDC absent (AWS Academy)</td>
-        <td>Injectar credencials via K8s Secret</td>
+        <td>Secrets Manager &rarr; K8s Secret &rarr; env vars</td>
       </tr>
       <tr>
         <td>MySQL chown sobre EFS</td>
@@ -534,7 +535,7 @@ kubectl scale deploy/wordpress -n wordpress --replicas=3
       <tr><th>Aspecte</th><th>Solucio</th></tr>
       <tr><td>IaC</td><td>Terraform amb LabRole (AWS Academy)</td></tr>
       <tr><td>Orquestracio</td><td>EKS, 2 AZs, 2 nodes</td></tr>
-      <tr><td>Persistencia</td><td>EFS dinamic (credencials injectades al CSI)</td></tr>
+      <tr><td>Persistencia</td><td>EFS dinamic (credencials via Secrets Manager)</td></tr>
       <tr><td>Sessions</td><td>Redis amb phpredis (mu-plugin)</td></tr>
       <tr><td>Auto-install</td><td>WP-CLI al setup.sh (ConfigMap)</td></tr>
       <tr><td>Alta disponibilitat</td><td>2 repliques WP + ReadWriteMany</td></tr>

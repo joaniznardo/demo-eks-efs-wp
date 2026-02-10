@@ -128,16 +128,21 @@ Hauries de veure 2 nodes en estat `Ready`.
 AWS Academy no te OIDC provider, per tant cal injectar les credencials AWS al
 controller EFS CSI perque puga crear Access Points automaticament.
 
+Les credencials es centralitzen a **AWS Secrets Manager** per facilitar la comparticio
+entre equips i mantenir un unic punt de veritat.
+
 ```bash
 # Executar l'script de configuracio (una sola vegada)
 ./scripts/setup-efs-dynamic.sh
 ```
 
-L'script fa 4 accions:
+L'script fa 6 accions:
 1. Elimina l'anotacio IRSA del Service Account del controller
-2. Crea un Secret amb les credencials AWS del Learner Lab
-3. Injecta el Secret com a variables d'entorn als containers del controller
-4. Reinicia el controller
+2. Llegeix les credencials de `~/.aws/credentials`
+3. Crea/actualitza el secret a AWS Secrets Manager (`eks-efs-credentials`)
+4. Llegeix de Secrets Manager per crear el K8s Secret `aws-credentials`
+5. Injecta el Secret com a variables d'entorn als containers del controller
+6. Reinicia el controller
 
 > **Detalls:** Consulta [dynamic-efs.md](dynamic-efs.md) per una explicacio completa.
 

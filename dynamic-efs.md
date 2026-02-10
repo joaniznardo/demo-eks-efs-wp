@@ -51,6 +51,55 @@ Les **variables d'entorn tenen la maxima prioritat**. Si injectem les credencial
 Learner Lab com a variables d'entorn als containers del controller EFS CSI, el SDK les
 usara directament sense intentar IRSA ni IMDS.
 
+## AWS Secrets Manager com a capa de centralitzacio
+
+Les credencials es gestionen a traves d'**AWS Secrets Manager** com a punt central
+d'emmagatzematge. Aixo permet:
+
+- **Centralitzacio**: un unic punt de veritat per les credencials
+- **Comparticio entre equips**: multiples desenvolupadors poden llegir el secret sense accedir al fitxer local d'un altre
+- **Auditoria**: AWS CloudTrail registra cada acces al secret
+- **Integracio**: altres serveis AWS poden llegir les credencials directament de Secrets Manager
+
+### Flux de credencials
+
+```
+~/.aws/credentials → AWS Secrets Manager → K8s Secret → EFS CSI Controller
+```
+
+1. Les credencials es llegeixen del fitxer local `~/.aws/credentials`
+2. Es pugen a AWS Secrets Manager amb el nom `eks-efs-credentials`
+3. Es llegeixen de Secrets Manager per crear el K8s Secret `aws-credentials`
+4. El K8s Secret s'injecta com a variables d'entorn al controller
+
+### Comandes AWS CLI per Secrets Manager
+
+```bash
+# Crear el secret (primera vegada)
+aws secretsmanager create-secret \
+  --name eks-efs-credentials \
+  --description "Credencials AWS Learner Lab per EFS CSI Controller" \
+  --secret-string '{"AWS_ACCESS_KEY_ID":"...","AWS_SECRET_ACCESS_KEY":"...","AWS_SESSION_TOKEN":"..."}' \
+  --region us-east-1
+
+# Actualitzar el secret (cada reinici del lab)
+aws secretsmanager update-secret \
+  --secret-id eks-efs-credentials \
+  --secret-string '{"AWS_ACCESS_KEY_ID":"...","AWS_SECRET_ACCESS_KEY":"...","AWS_SESSION_TOKEN":"..."}' \
+  --region us-east-1
+
+# Llegir el secret
+aws secretsmanager get-secret-value \
+  --secret-id eks-efs-credentials \
+  --region us-east-1
+
+# Eliminar el secret (neteja)
+aws secretsmanager delete-secret \
+  --secret-id eks-efs-credentials \
+  --force-delete-without-recovery \
+  --region us-east-1
+```
+
 ### Passos
 
 #### 1. Eliminar l'anotacio IRSA del Service Account
@@ -62,22 +111,42 @@ kubectl annotate sa efs-csi-controller-sa -n kube-system \
 
 Eliminar l'anotacio evita que el SDK intente usar web identity tokens.
 
-#### 2. Crear un Secret amb les credencials AWS
+#### 2. Pujar credencials a AWS Secrets Manager
 
 ```bash
 KEY=$(sed -n 's/^aws_access_key_id=//p' ~/.aws/credentials | head -1)
 SECRET=$(sed -n 's/^aws_secret_access_key=//p' ~/.aws/credentials | head -1)
 TOKEN=$(sed -n 's/^aws_session_token=//p' ~/.aws/credentials | head -1)
 
+# Crear o actualitzar el secret a Secrets Manager
+aws secretsmanager create-secret \
+  --name eks-efs-credentials \
+  --secret-string "{\"AWS_ACCESS_KEY_ID\":\"$KEY\",\"AWS_SECRET_ACCESS_KEY\":\"$SECRET\",\"AWS_SESSION_TOKEN\":\"$TOKEN\"}" \
+  --region us-east-1
+```
+
+#### 3. Crear el K8s Secret des de Secrets Manager
+
+```bash
+# Llegir de Secrets Manager
+SM_VALUE=$(aws secretsmanager get-secret-value \
+  --secret-id eks-efs-credentials \
+  --region us-east-1 \
+  --query 'SecretString' --output text)
+
+SM_KEY=$(echo "$SM_VALUE" | python3 -c "import json,sys; print(json.load(sys.stdin)['AWS_ACCESS_KEY_ID'])")
+SM_SECRET=$(echo "$SM_VALUE" | python3 -c "import json,sys; print(json.load(sys.stdin)['AWS_SECRET_ACCESS_KEY'])")
+SM_TOKEN=$(echo "$SM_VALUE" | python3 -c "import json,sys; print(json.load(sys.stdin)['AWS_SESSION_TOKEN'])")
+
 kubectl create secret generic aws-credentials \
   -n kube-system \
-  --from-literal=AWS_ACCESS_KEY_ID="$KEY" \
-  --from-literal=AWS_SECRET_ACCESS_KEY="$SECRET" \
-  --from-literal=AWS_SESSION_TOKEN="$TOKEN" \
+  --from-literal=AWS_ACCESS_KEY_ID="$SM_KEY" \
+  --from-literal=AWS_SECRET_ACCESS_KEY="$SM_SECRET" \
+  --from-literal=AWS_SESSION_TOKEN="$SM_TOKEN" \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-#### 3. Injectar el Secret als containers del controller
+#### 4. Injectar el Secret als containers del controller
 
 ```bash
 # Obtenir el nombre de containers del deployment
@@ -96,13 +165,13 @@ PATCH="$PATCH]"
 kubectl patch deploy efs-csi-controller -n kube-system --type=json -p="$PATCH"
 ```
 
-#### 4. Esperar el rollout
+#### 5. Esperar el rollout
 
 ```bash
 kubectl rollout status deploy/efs-csi-controller -n kube-system --timeout=90s
 ```
 
-#### 5. Verificar
+#### 6. Verificar
 
 ```bash
 kubectl exec deploy/efs-csi-controller -n kube-system -c efs-plugin -- env | grep AWS_
@@ -192,8 +261,9 @@ actualitzar el Secret i reiniciar el controller:
 
 Aquest script:
 1. Llegeix les noves credencials de `~/.aws/credentials`
-2. Actualitza el Secret `aws-credentials` a `kube-system`
-3. Reinicia el deployment `efs-csi-controller`
+2. Actualitza el secret a AWS Secrets Manager (`eks-efs-credentials`)
+3. Llegeix de Secrets Manager per actualitzar el K8s Secret `aws-credentials`
+4. Reinicia el deployment `efs-csi-controller`
 
 ## Scripts
 
@@ -218,6 +288,11 @@ Aquest script:
 
 ```
                     ~/.aws/credentials
+                           │
+                    ┌──────┴──────────────┐
+                    │  AWS Secrets Manager │
+                    │  (eks-efs-credentials)│
+                    └──────┬──────────────┘
                            │
                     ┌──────┴──────┐
                     │  K8s Secret │
