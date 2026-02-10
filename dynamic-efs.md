@@ -317,3 +317,104 @@ Aquest script:
                     │  └── /mysql    (uid 999) │
                     └─────────────────────────┘
 ```
+
+## Alternativa: GitHub Secrets
+
+En lloc d'AWS Secrets Manager, es pot usar **GitHub Secrets** del repositori com a
+punt central per emmagatzemar les credencials. Aquesta alternativa es util quan:
+
+- Es vol gestionar les credencials via **CI/CD amb GitHub Actions**
+- No es vol dependre d'AWS Secrets Manager (menys serveis AWS implicats)
+- Es vol poder actualitzar credencials **remotament** sense acces local al cluster
+
+### Limitacio clau
+
+GitHub Secrets son **write-only** des de l'API. Es poden establir amb `gh secret set`
+pero no es poden llegir amb `gh secret get`. Nomes son accessibles com a **variables
+d'entorn** dins dels workflows de GitHub Actions.
+
+### Flux de credencials (GitHub Secrets)
+
+```
+~/.aws/credentials → GitHub Secrets → GitHub Actions → K8s Secret → EFS CSI Controller
+                          │
+                          └── (write-only: no es poden llegir via API)
+```
+
+1. Les credencials es llegeixen del fitxer local `~/.aws/credentials`
+2. Es pugen a GitHub Secrets amb `gh secret set` (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+3. El K8s Secret es crea **directament** des de les credencials locals (setup inicial)
+4. Per actualitzacions remotes, un **workflow de GitHub Actions** llegeix els secrets i actualitza el K8s Secret
+
+### Scripts alternatius
+
+| Script | Us | Quan |
+|--------|-----|------|
+| `scripts/setup-efs-github-secrets.sh` | Configuracio inicial (GitHub Secrets) | Una sola vegada despres de crear el cluster |
+| `scripts/update-aws-credentials-github.sh` | Actualitzar credencials (GitHub Secrets) | Cada cop que es reinicia el Learner Lab |
+
+### Workflow de GitHub Actions
+
+El fitxer `.github/workflows/update-efs-credentials.yml` permet actualitzar les
+credencials del cluster **remotament** via `workflow_dispatch`:
+
+```bash
+# Disparar el workflow manualment
+gh workflow run update-efs-credentials.yml
+
+# Veure l'estat de l'execucio
+gh run list --workflow=update-efs-credentials.yml
+```
+
+El workflow:
+1. Llegeix les credencials des de GitHub Secrets (com a variables d'entorn)
+2. Configura kubectl contra el cluster EKS
+3. Crea/actualitza el K8s Secret `aws-credentials`
+4. Reinicia el controller EFS CSI
+
+### Comparativa: Secrets Manager vs GitHub Secrets
+
+| Aspecte | AWS Secrets Manager | GitHub Secrets |
+|---------|-------------------|----------------|
+| Emmagatzematge | AWS cloud | GitHub repositori |
+| Lectura via API | Si (`get-secret-value`) | No (write-only) |
+| Integracio CI/CD | Via AWS CLI | Nativa (env vars) |
+| Auditoria | CloudTrail | GitHub Audit Log |
+| Cost | ~0.40$/mes per secret | Gratis (repos publics i privats) |
+| Actualitzacio remota | Via AWS CLI | Via GitHub Actions workflow |
+| Dependencia | AWS SDK/CLI | `gh` CLI |
+
+### Diagrama del flux (GitHub Secrets)
+
+```
+                    ~/.aws/credentials
+                           │
+                    ┌──────┴──────────────┐
+                    │   GitHub Secrets    │
+                    │   (write-only)      │
+                    └──────┬──────────────┘
+                           │  GitHub Actions
+                           │  (workflow_dispatch)
+                    ┌──────┴──────┐
+                    │  K8s Secret │
+                    │  (env vars) │
+                    └──────┬──────┘
+                           │
+                    ┌──────┴──────────┐
+                    │  EFS CSI        │
+                    │  Controller     │
+                    │  (kube-system)  │
+                    └──────┬──────────┘
+                           │  AWS SDK v2
+                           │  (credencials via env)
+                    ┌──────┴──────┐
+                    │  AWS EFS    │
+                    │  API        │
+                    └──────┬──────┘
+                           │  Crea Access Points
+                    ┌──────┴──────────────────┐
+                    │  EFS File System        │
+                    │  ├── /wordpress (uid 33) │
+                    │  └── /mysql    (uid 999) │
+                    └─────────────────────────┘
+```

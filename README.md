@@ -57,8 +57,12 @@ k8s/
   04-redis.yaml        # Deployment + Service
   05-wordpress.yaml    # ConfigMap (setup.sh + redis-sessions.php) + PVC + Deploy + LB
 scripts/
-  setup-efs-dynamic.sh       # Configuracio inicial del provisionament dinamic
-  update-aws-credentials.sh  # Actualitzar credencials quan el lab es reinicia
+  setup-efs-dynamic.sh             # Configuracio inicial (via AWS Secrets Manager)
+  update-aws-credentials.sh        # Actualitzar credencials (via AWS Secrets Manager)
+  setup-efs-github-secrets.sh      # Configuracio inicial (via GitHub Secrets) [alternativa]
+  update-aws-credentials-github.sh # Actualitzar credencials (via GitHub Secrets) [alternativa]
+.github/workflows/
+  update-efs-credentials.yml       # Workflow per actualitzar credencials remotament
 dynamic-efs.md         # Explicacio detallada del provisionament dinamic
 troubleshoot.md        # Problemes trobats i solucions
 README.md              # Aquesta guia
@@ -214,6 +218,25 @@ Les credencials del Learner Lab caduquen quan el lab es reinicia. Cal actualitza
 ```bash
 ./scripts/update-aws-credentials.sh
 ```
+
+### Alternativa: GitHub Secrets
+
+Si prefereixes centralitzar les credencials a **GitHub Secrets** en lloc d'AWS Secrets Manager,
+pots usar els scripts alternatius:
+
+```bash
+# Configuracio inicial (una sola vegada)
+./scripts/setup-efs-github-secrets.sh
+
+# Actualitzar credencials (cada reinici del lab)
+./scripts/update-aws-credentials-github.sh
+
+# O actualitzar remotament via GitHub Actions (sense acces local al cluster)
+./scripts/update-aws-credentials-github.sh --remote
+```
+
+Requereix `gh` CLI autenticat. Consulta [dynamic-efs.md](dynamic-efs.md#alternativa-github-secrets)
+per una comparativa detallada entre les dues opcions.
 
 ## Verificacions
 

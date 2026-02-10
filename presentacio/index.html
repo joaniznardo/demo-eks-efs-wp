@@ -240,6 +240,27 @@ kubectl patch deploy efs-csi-controller ...
       </code></pre>
     </section>
     <section>
+      <h3>Alternativa: GitHub Secrets</h3>
+      <div class="solution-box">
+        <p>Centralitzar credencials a <strong>GitHub Secrets</strong> del repositori
+           i usar <strong>GitHub Actions</strong> per actualitzar-les remotament</p>
+      </div>
+      <table>
+        <tr><th>Aspecte</th><th><span class="highlight-orange">Secrets Manager</span></th><th><span class="highlight-blue">GitHub Secrets</span></th></tr>
+        <tr><td>Lectura API</td><td>Si</td><td>No (write-only)</td></tr>
+        <tr><td>CI/CD</td><td>Via AWS CLI</td><td>Nativa (env vars)</td></tr>
+        <tr><td>Cost</td><td>~0.40$/mes</td><td>Gratis</td></tr>
+        <tr><td>Actualitzacio remota</td><td>AWS CLI</td><td>GitHub Actions</td></tr>
+      </table>
+      <pre style="font-size: 0.45em;"><code class="language-text">
+~/.aws/credentials &rarr; gh secret set &rarr; GitHub Secrets
+                                             &darr;
+                           GitHub Actions (workflow_dispatch)
+                                             &darr;
+                                    K8s Secret &rarr; EFS CSI Controller
+      </code></pre>
+    </section>
+    <section>
       <h3>Resultat: provisionament dinamic!</h3>
       <pre><code class="language-bash">
 $ kubectl get pvc -n wordpress
@@ -440,6 +461,16 @@ docker-php-ext-enable redis
         <td><code>update-aws-credentials.sh</code></td>
         <td>Actualitzar credencials AWS</td>
         <td>Cada reinici del lab</td>
+      </tr>
+      <tr>
+        <td><code>setup-efs-github-secrets.sh</code></td>
+        <td>Setup amb <span class="highlight-blue">GitHub Secrets</span></td>
+        <td>Una sola vegada (alt.)</td>
+      </tr>
+      <tr>
+        <td><code>update-aws-credentials-github.sh</code></td>
+        <td>Actualitzar via <span class="highlight-blue">GitHub Secrets</span></td>
+        <td>Cada reinici (alt.)</td>
       </tr>
     </table>
   </section>
